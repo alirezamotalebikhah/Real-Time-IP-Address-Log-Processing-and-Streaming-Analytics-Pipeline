@@ -1,0 +1,162 @@
+services:
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    container_name: zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      bigdata-net:
+        ipv4_address: 172.28.0.2
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      bigdata-net:
+        ipv4_address: 172.28.0.3
+    command: >
+      bash -c "
+      /etc/confluent/docker/run &
+      sleep 10 &&
+      kafka-topics --create --topic logs --bootstrap-server kafka:9092 --partitions 1 --replication-factor 1 &&
+      tail -f /dev/null
+      "
+    healthcheck:
+      test: [ "CMD", "bash", "-c", "echo > /dev/tcp/localhost/9092" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+
+  # Cassandra
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    hostname: cassandra
+    networks:
+      bigdata-net:
+        ipv4_address: 172.28.0.4
+    ports:
+      - "9042:9042"
+      - "7199:7199"   # JMX
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    environment:
+      - CASSANDRA_CLUSTER_NAME=LogsCluster
+      - HEAP_NEWSIZE=512M
+      - MAX_HEAP_SIZE=1G
+    healthcheck:
+      test: [ "CMD", "cqlsh", "-e", "DESC keyspaces" ]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    command: >
+      bash -c "
+        /usr/local/bin/docker-entrypoint.sh cassandra -f &
+      
+        echo 'Waiting for Cassandra to be ready...'
+        until cqlsh 127.0.0.1 -e 'describe keyspaces' > /dev/null 2>&1; do
+          echo 'Cassandra is not ready yet - sleeping...'
+          sleep 5
+        done
+      
+        echo 'Cassandra is up! Creating keyspace and table...'
+        cqlsh 127.0.0.1 -e \"
+          DROP KEYSPACE IF EXISTS logs_ks;
+          CREATE KEYSPACE IF NOT EXISTS logs_ks 
+            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+      
+          USE logs_ks;
+      
+          CREATE TABLE IF NOT EXISTS logs (
+            log_timestamp double,
+            ip text,
+            url text,
+            PRIMARY KEY (log_timestamp)
+          );
+      
+          DESCRIBE TABLE logs;
+        \"
+      
+        echo 'Keyspace and table created successfully!'
+        echo 'Keeping container alive...'
+        tail -f /dev/null
+      "
+
+  # Producer (Python code to send data to Kafka)
+  producer:
+    build: Producer
+    container_name: producer
+    hostname: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+      spark:
+        condition: service_healthy
+    networks:
+      bigdata-net:
+        ipv4_address: 172.28.0.5
+    command: >
+      bash -c "sleep 20 && python /app/producer.py"
+
+  # Spark (Master + Worker) for streaming to Cassandra
+  spark:
+    build: spark
+    container_name: spark
+    hostname: spark
+    depends_on:
+      kafka:
+        condition: service-healthy
+      cassandra:
+        condition: service-healthy
+    volumes:
+      - ./spark:/opt/spark-apps
+    environment:
+      - SPARK_MODE=master
+      - SPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.0 /opt/spark-apps/spark_stream_to_cassandra.py
+    command: bash -c "sleep 30 && spark-submit \
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.0,com.datastax.spark:spark-cassandra-connector_2.13:3.5.0\
+      --conf spark.cassandra.connection.host=172.28.0.4 \
+      --conf spark.cassandra.connection.port=9042 \
+      /opt/spark-apps/spark_stream_to_cassandra.py"
+    networks:
+      bigdata-net:
+        ipv4_address: 172.28.0.6
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+
+volumes:
+  cassandra-data:
+networks:
+  bigdata-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
